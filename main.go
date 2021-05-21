@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -14,12 +13,13 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/itchyny/gojq"
-	_ "github.com/jessevdk/go-flags"
+	"github.com/jessevdk/go-flags"
 	"github.com/lestrrat-go/backoff/v2"
 	"go.uber.org/ratelimit"
 	"golang.org/x/oauth2/google"
@@ -37,103 +37,97 @@ func main() {
 	}
 }
 
-type params struct {
-	BillingProject string `long:"billing-project"`
-	CollectionName string `long:"collection"`
+type opts struct {
+	BillingProject string `long:"billing-project" env:"GCLOUD_BILLING_QUOTA_PROJECT"`
 	Parallelism    int64  `long:"parallelism" default:"1"`
 	LogHttp        bool   `long:"log-http"`
-	RawInput       bool   `long:"raw-input"`
 	RateLimit      int    `long:"rate-limit-per-minute"`
-	Url            string `long:"url"`
-	Execute        bool   `long:"execute"`
+	Url            string `long:"url" description:"URL generator written by jq filter" unquote:"false"`
+	Execute        bool   `long:"execute" description:"Execute without dry-run"`
 	Verbose        bool   `long:"verbose"`
-	AutoCollection bool   `long:"auto-collection"`
+	CollectionName string `long:"collection" description:"Collection name in favor of AIP-132 for paging (exclusive with --auto-collection"`
+	AutoCollection bool   `long:"auto-collection" description:"Infer collection name from URL for paging (exclusive with --collection)"`
 	YamlInput      bool   `long:"yaml-input"`
-	FilterError    bool   `long:"filter-error"`
+	RawInput       bool   `long:"raw-input"`
+	IncludeError   bool   `long:"include-error"`
 	YamlOutput     bool   `long:"yaml-output"`
 }
 
-func parseParame() (params, error) {
-	// flagParser := flags.NewParser(&o, flags.Default)
-	// _, err := flagParser.ParseArgs()
-	// if err != nil {
-	// 	return o, err
-	// }
-	// return o, nil
-	billingProject := flag.String("billing-project", "", "")
-	collectionName := flag.String("collection", "", "collection field name for paginated list method")
-	parallelism := flag.Int64("parallelism", 1, "")
-	filterError := flag.Bool("filter-error", false, "")
-	logHttp := flag.Bool("log-http", false, "")
-	autoCollection := flag.Bool("auto-collection", false, "Infer collection name from URL path")
-	rawInput := flag.Bool("raw-input", false, "")
-	rateLimit := flag.Int("rate-limit-per-minute", 0, "")
-	urlGenerator := flag.String("url", "", "")
-	verbose := flag.Bool("verbose", false, "")
-	yamlInput := flag.Bool("yaml-input", false, "")
-	yamlOutput := flag.Bool("yaml-output", false, "")
-	execute := flag.Bool("execute", false, "")
-	flag.Parse()
-	return params{
-		BillingProject: *billingProject,
-		CollectionName: *collectionName,
-		Parallelism:    *parallelism,
-		LogHttp:        *logHttp,
-		FilterError:    *filterError,
-		Verbose:        *verbose,
-		RawInput:       *rawInput,
-		Url:            *urlGenerator,
-		AutoCollection: *autoCollection,
-		Execute:        *execute,
-		RateLimit:      *rateLimit,
-		YamlInput:      *yamlInput,
-		YamlOutput:     *yamlOutput,
-	}, nil
+func isErrHelp(err error) bool {
+	if e, ok := err.(*flags.Error); ok && e.Type == flags.ErrHelp {
+		return true
+	}
+	return false
+}
+func parseOpts() (o opts, err error) {
+	flagParser := flags.NewParser(&o, flags.Default)
+	defer func() {
+		if err == nil {
+			return
+		}
+		if isErrHelp(err) {
+			return
+		}
+		log.Print(err)
+		flagParser.WriteHelp(os.Stderr)
+	}()
+	_, err = flagParser.Parse()
+	if err != nil {
+		return o, err
+	}
+	if o.YamlInput && o.RawInput {
+		return o, errors.New("--yaml-input and --raw-input are exclusive")
+	}
+	if o.AutoCollection && o.CollectionName != "" {
+		return o, errors.New("--auto-collection and --collection are exclusive")
+	}
+	return o, nil
 }
 
-type lineDecoder struct{
+// adapter for bufio.Scanner
+type lineDecoder struct {
 	input *bufio.Scanner
 }
 
 type output struct {
-	Input interface{} `json:"input"`
+	Input    interface{} `json:"input"`
 	Response interface{} `json:"response"`
 }
 
-func(d *lineDecoder) Decode(i interface{}) error {
+func (d *lineDecoder) Decode(i interface{}) error {
 	if !d.input.Scan() {
 		if d.input.Err() == nil {
 			return io.EOF
 		}
 		return d.input.Err()
 	}
-	*(i.(*interface{})) = d.input.Text()
+	reflect.Indirect(reflect.ValueOf(i)).Set(reflect.ValueOf(d.input.Text()))
 	return nil
 }
 
 func _main() error {
-	params, err := parseParame()
+	opts, err := parseOpts()
 	if err != nil {
-		return err
+		os.Exit(1)
 	}
 
-	if params.AutoCollection && params.CollectionName != "" {
+	if opts.AutoCollection && opts.CollectionName != "" {
 		return errors.New("--auto-collection and --collection are exclusive")
 	}
 
 	var rl ratelimit.Limiter
-	if params.RateLimit != 0 {
-		rl = ratelimit.New(params.RateLimit, ratelimit.Per(time.Minute))
+	if opts.RateLimit != 0 {
+		rl = ratelimit.New(opts.RateLimit, ratelimit.Per(time.Minute))
 	} else {
 		rl = ratelimit.NewUnlimited()
 	}
 
 	backoffPolicy := backoff.Exponential(
-		backoff.WithMinInterval(1 * time.Second),
+		backoff.WithMinInterval(1*time.Second),
 		backoff.WithMaxInterval(time.Minute),
 		backoff.WithJitterFactor(0.1))
 
-	query, err := gojq.Parse(fmt.Sprintf(`%s`, params.Url))
+	query, err := gojq.Parse(fmt.Sprintf(`%s`, opts.Url))
 	if err != nil {
 		return err
 	}
@@ -151,13 +145,13 @@ func _main() error {
 	var enc interface {
 		Encode(interface{}) error
 	}
-	if params.YamlOutput {
+	if opts.YamlOutput {
 		enc = yaml.NewEncoder(os.Stdout)
 	} else {
 		enc = json.NewEncoder(os.Stdout)
 	}
 
-	sem := semaphore.NewWeighted(params.Parallelism)
+	sem := semaphore.NewWeighted(opts.Parallelism)
 	var muStderr sync.Mutex
 	var muStdout sync.Mutex
 
@@ -165,9 +159,9 @@ func _main() error {
 		Decode(interface{}) error
 	}
 
-	if params.RawInput {
+	if opts.RawInput {
 		dec = &lineDecoder{bufio.NewScanner(os.Stdin)}
-	} else if params.YamlInput {
+	} else if opts.YamlInput {
 		dec = yaml.NewDecoder(os.Stdin)
 	} else {
 		dec = json.NewDecoder(os.Stdin)
@@ -198,9 +192,9 @@ func _main() error {
 			count++
 
 			var collectionName string
-			if params.CollectionName != "" {
-				collectionName = params.CollectionName
-			} else if params.AutoCollection {
+			if opts.CollectionName != "" {
+				collectionName = opts.CollectionName
+			} else if opts.AutoCollection {
 				u, err := url.Parse(baseUrl)
 				if err != nil {
 					return err
@@ -229,15 +223,15 @@ func _main() error {
 						q.Add("pageToken", nextPageToken)
 					}
 					req.URL.RawQuery = q.Encode()
-					if params.BillingProject != "" {
-						req.Header.Add("x-goog-user-project", params.BillingProject)
+					if opts.BillingProject != "" {
+						req.Header.Add("x-goog-user-project", opts.BillingProject)
 					}
-					if !params.Execute || params.Verbose {
+					if !opts.Execute || opts.Verbose {
 						muStderr.Lock()
 						log.Printf("do url[%v]: %v %v\n", nowCount, req.Method, req.URL.String())
 						muStderr.Unlock()
 					}
-					if !params.Execute {
+					if !opts.Execute {
 						return nil
 					}
 
@@ -246,7 +240,7 @@ func _main() error {
 						for backoff.Continue(backoffCtl) {
 							resp, err := func() (*http.Response, error) {
 								var buf bytes.Buffer
-								if params.LogHttp {
+								if opts.LogHttp {
 									defer func() {
 										muStderr.Lock()
 										defer muStderr.Unlock()
@@ -270,11 +264,11 @@ func _main() error {
 								return resp, err
 							} else if resp.StatusCode == http.StatusOK {
 								return resp, nil
-							} else if resp.StatusCode == http.StatusTooManyRequests  {
+							} else if resp.StatusCode == http.StatusTooManyRequests {
 								log.Printf("retry url[%v]: %v %v, reason: %v\n", nowCount, resp.Request.Method, resp.Request.URL.String(), resp.Status)
 								continue
-							} else if resp.StatusCode >= 400 && resp.StatusCode < 500{
-								log.Printf("error url[%v]: %v %v, reason: %v\n", nowCount,resp.Request.Method, resp.Request.URL.String(), resp.Status)
+							} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+								log.Printf("error url[%v]: %v %v, reason: %v\n", nowCount, resp.Request.Method, resp.Request.URL.String(), resp.Status)
 								return resp, nil
 							}
 						}
@@ -292,14 +286,14 @@ func _main() error {
 						return err
 					}
 
-					if params.FilterError && resp.StatusCode != http.StatusOK {
+					if !opts.IncludeError && resp.StatusCode != http.StatusOK {
 						return nil
 					}
 
 					if collectionName == "" || resp.StatusCode != http.StatusOK {
 						result = output{
-							Input: input,
-							Response:  i,
+							Input:    input,
+							Response: i,
 						}
 						break
 					}
@@ -317,7 +311,7 @@ func _main() error {
 						response[collectionName] = collection
 					}
 					result = output{
-						Input: input,
+						Input:    input,
 						Response: response,
 					}
 					break

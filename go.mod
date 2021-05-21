@@ -1,4 +1,4 @@
-module github.com/apstndb/listforeach
+module github.com/apstndb/gcplistforeach
 
 go 1.16
 
