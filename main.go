@@ -9,13 +9,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/itchyny/gojq"
+	_ "github.com/jessevdk/go-flags"
 	"github.com/lestrrat-go/backoff/v2"
 	"go.uber.org/ratelimit"
 	"golang.org/x/oauth2/google"
@@ -34,42 +38,57 @@ func main() {
 }
 
 type params struct {
-	BillingProject string
-	collectionName string
-	parallelism int64
-	logHttp bool
-	RawInput bool
-	rateLimit int
-	url string
-	execute bool
-	yamlInput bool
-	yamlOutput bool
+	BillingProject string `long:"billing-project"`
+	CollectionName string `long:"collection"`
+	Parallelism    int64  `long:"parallelism" default:"1"`
+	LogHttp        bool   `long:"log-http"`
+	RawInput       bool   `long:"raw-input"`
+	RateLimit      int    `long:"rate-limit-per-minute"`
+	Url            string `long:"url"`
+	Execute        bool   `long:"execute"`
+	Verbose        bool   `long:"verbose"`
+	AutoCollection bool   `long:"auto-collection"`
+	YamlInput      bool   `long:"yaml-input"`
+	FilterError    bool   `long:"filter-error"`
+	YamlOutput     bool   `long:"yaml-output"`
 }
 
-func parseParame() params {
+func parseParame() (params, error) {
+	// flagParser := flags.NewParser(&o, flags.Default)
+	// _, err := flagParser.ParseArgs()
+	// if err != nil {
+	// 	return o, err
+	// }
+	// return o, nil
 	billingProject := flag.String("billing-project", "", "")
 	collectionName := flag.String("collection", "", "collection field name for paginated list method")
 	parallelism := flag.Int64("parallelism", 1, "")
+	filterError := flag.Bool("filter-error", false, "")
 	logHttp := flag.Bool("log-http", false, "")
+	autoCollection := flag.Bool("auto-collection", false, "Infer collection name from URL path")
 	rawInput := flag.Bool("raw-input", false, "")
 	rateLimit := flag.Int("rate-limit-per-minute", 0, "")
-	url := flag.String("url", "", "")
+	urlGenerator := flag.String("url", "", "")
+	verbose := flag.Bool("verbose", false, "")
 	yamlInput := flag.Bool("yaml-input", false, "")
 	yamlOutput := flag.Bool("yaml-output", false, "")
 	execute := flag.Bool("execute", false, "")
 	flag.Parse()
 	return params{
 		BillingProject: *billingProject,
-		collectionName: *collectionName,
-		parallelism:    *parallelism,
-		logHttp:        *logHttp,
+		CollectionName: *collectionName,
+		Parallelism:    *parallelism,
+		LogHttp:        *logHttp,
+		FilterError:    *filterError,
+		Verbose:        *verbose,
 		RawInput:       *rawInput,
-		url:            *url,
-		execute:        *execute,
-		rateLimit: *rateLimit,
-		yamlInput: *yamlInput,
-		yamlOutput: *yamlOutput,
-	}
+		Url:            *urlGenerator,
+		AutoCollection: *autoCollection,
+		Execute:        *execute,
+		RateLimit:      *rateLimit,
+		YamlInput:      *yamlInput,
+		YamlOutput:     *yamlOutput,
+	}, nil
 }
 
 type lineDecoder struct{
@@ -83,6 +102,9 @@ type output struct {
 
 func(d *lineDecoder) Decode(i interface{}) error {
 	if !d.input.Scan() {
+		if d.input.Err() == nil {
+			return io.EOF
+		}
 		return d.input.Err()
 	}
 	*(i.(*interface{})) = d.input.Text()
@@ -90,11 +112,18 @@ func(d *lineDecoder) Decode(i interface{}) error {
 }
 
 func _main() error {
-	params := parseParame()
+	params, err := parseParame()
+	if err != nil {
+		return err
+	}
+
+	if params.AutoCollection && params.CollectionName != "" {
+		return errors.New("--auto-collection and --collection are exclusive")
+	}
 
 	var rl ratelimit.Limiter
-	if params.rateLimit != 0 {
-		rl = ratelimit.New(params.rateLimit, ratelimit.Per(time.Minute))
+	if params.RateLimit != 0 {
+		rl = ratelimit.New(params.RateLimit, ratelimit.Per(time.Minute))
 	} else {
 		rl = ratelimit.NewUnlimited()
 	}
@@ -104,7 +133,7 @@ func _main() error {
 		backoff.WithMaxInterval(time.Minute),
 		backoff.WithJitterFactor(0.1))
 
-	query, err := gojq.Parse(fmt.Sprintf(`%s`, params.url))
+	query, err := gojq.Parse(fmt.Sprintf(`%s`, params.Url))
 	if err != nil {
 		return err
 	}
@@ -122,13 +151,13 @@ func _main() error {
 	var enc interface {
 		Encode(interface{}) error
 	}
-	if params.yamlOutput {
+	if params.YamlOutput {
 		enc = yaml.NewEncoder(os.Stdout)
 	} else {
 		enc = json.NewEncoder(os.Stdout)
 	}
 
-	sem := semaphore.NewWeighted(params.parallelism)
+	sem := semaphore.NewWeighted(params.Parallelism)
 	var muStderr sync.Mutex
 	var muStdout sync.Mutex
 
@@ -138,12 +167,13 @@ func _main() error {
 
 	if params.RawInput {
 		dec = &lineDecoder{bufio.NewScanner(os.Stdin)}
-	} else if params.yamlInput {
+	} else if params.YamlInput {
 		dec = yaml.NewDecoder(os.Stdin)
 	} else {
 		dec = json.NewDecoder(os.Stdin)
 	}
 
+	var count int
 	eg, ctx := errgroup.WithContext(ctx)
 	for {
 		var input interface{}
@@ -159,20 +189,38 @@ func _main() error {
 			if !ok {
 				break
 			}
-			url, ok := i.(string)
+			baseUrl, ok := i.(string)
 			if !ok {
 				return fmt.Errorf("not string: %v", i)
 			}
-			eg.Go(func() error {
-				if err := sem.Acquire(ctx, 1); err != nil {
+
+			nowCount := count
+			count++
+
+			var collectionName string
+			if params.CollectionName != "" {
+				collectionName = params.CollectionName
+			} else if params.AutoCollection {
+				u, err := url.Parse(baseUrl)
+				if err != nil {
 					return err
 				}
+
+				pathElems := strings.Split(u.Path, "/")
+				collectionName = pathElems[len(pathElems)-1]
+			}
+
+			// Acquire semaphore before eg.Go to stabilize output order when parallelism=1
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return err
+			}
+			eg.Go(func() error {
 				defer sem.Release(1)
 				var nextPageToken string
 				var collection []interface{}
 				var result output
 				for {
-					req, err := http.NewRequest(http.MethodGet, url, nil)
+					req, err := http.NewRequest(http.MethodGet, baseUrl, nil)
 					if err != nil {
 						return err
 					}
@@ -184,10 +232,12 @@ func _main() error {
 					if params.BillingProject != "" {
 						req.Header.Add("x-goog-user-project", params.BillingProject)
 					}
-					if !params.execute {
+					if !params.Execute || params.Verbose {
 						muStderr.Lock()
-						fmt.Fprintf(os.Stderr, "%s %s\n", req.Method, req.URL.String())
+						log.Printf("do url[%v]: %v %v\n", nowCount, req.Method, req.URL.String())
 						muStderr.Unlock()
+					}
+					if !params.Execute {
 						return nil
 					}
 
@@ -196,7 +246,7 @@ func _main() error {
 						for backoff.Continue(backoffCtl) {
 							resp, err := func() (*http.Response, error) {
 								var buf bytes.Buffer
-								if params.logHttp {
+								if params.LogHttp {
 									defer func() {
 										muStderr.Lock()
 										defer muStderr.Unlock()
@@ -221,8 +271,10 @@ func _main() error {
 							} else if resp.StatusCode == http.StatusOK {
 								return resp, nil
 							} else if resp.StatusCode == http.StatusTooManyRequests  {
+								log.Printf("retry url[%v]: %v %v, reason: %v\n", nowCount, resp.Request.Method, resp.Request.URL.String(), resp.Status)
 								continue
 							} else if resp.StatusCode >= 400 && resp.StatusCode < 500{
+								log.Printf("error url[%v]: %v %v, reason: %v\n", nowCount,resp.Request.Method, resp.Request.URL.String(), resp.Status)
 								return resp, nil
 							}
 						}
@@ -240,7 +292,11 @@ func _main() error {
 						return err
 					}
 
-					if params.collectionName == "" || resp.StatusCode != http.StatusOK {
+					if params.FilterError && resp.StatusCode != http.StatusOK {
+						return nil
+					}
+
+					if collectionName == "" || resp.StatusCode != http.StatusOK {
 						result = output{
 							Input: input,
 							Response:  i,
@@ -248,7 +304,7 @@ func _main() error {
 						break
 					}
 
-					if c, ok := i[params.collectionName].([]interface{}); ok {
+					if c, ok := i[collectionName].([]interface{}); ok {
 						collection = append(collection, c...)
 					}
 					if npt, ok := i["nextPageToken"].(string); ok {
@@ -258,7 +314,7 @@ func _main() error {
 					response := make(map[string]interface{})
 					// leave response empty if collection is nil
 					if collection != nil {
-						response[params.collectionName] = collection
+						response[collectionName] = collection
 					}
 					result = output{
 						Input: input,
